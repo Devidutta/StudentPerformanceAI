@@ -42,10 +42,11 @@ public sealed class TracingService : IDisposable
             {
                 id = span.RunId,
                 trace_id = span.TraceId,
+                dotted_order = span.DottedOrder,
                 parent_run_id = span.ParentRunId,
                 name = span.Name,
                 run_type = span.RunType,
-                project_name = _options.Project,
+                session_name = _options.Project,
                 inputs = span.Inputs ?? new { },
                 start_time = span.StartedAt.ToString("o")
             });
@@ -111,6 +112,12 @@ public sealed class TraceSpan : IAsyncDisposable
     public object? Inputs { get; }
     public DateTimeOffset StartedAt { get; } = DateTimeOffset.UtcNow;
 
+    /// <summary>
+    /// LangSmith's sortable trace-tree position key (see their run data format docs). Root spans only
+    /// for now, since nothing in this app currently nests spans via parentRunId.
+    /// </summary>
+    public string DottedOrder { get; }
+
     internal TraceSpan(TracingService tracer, string name, string runType, object? inputs, string? parentRunId)
     {
         _tracer = tracer;
@@ -119,6 +126,7 @@ public sealed class TraceSpan : IAsyncDisposable
         Inputs = inputs;
         ParentRunId = parentRunId;
         TraceId = parentRunId ?? RunId;
+        DottedOrder = $"{StartedAt:yyyyMMddTHHmmssffffff}Z{RunId.Replace("-", "")}";
         _startTask = _tracer.PostRunStartAsync(this);
     }
 
