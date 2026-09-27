@@ -1,5 +1,4 @@
 using System.ClientModel;
-using ChromaDB.Client;
 using ModelContextProtocol.Protocol;
 using OpenAI;
 using StudentPerformanceAI.McpServer.McpTools;
@@ -57,7 +56,7 @@ try
 
     var chromaOptions = new ChromaOptions
     {
-        BaseUrl = OptionalValue("CHROMA_BASE_URL", "Chroma:BaseUrl", "http://localhost:8000/api/v1/")!,
+        BaseUrl = OptionalValue("CHROMA_BASE_URL", "Chroma:BaseUrl", "http://localhost:8000")!,
         CollectionName = OptionalValue("CHROMA_COLLECTION_NAME", "Chroma:CollectionName", "student-performance-notes")!,
         AuthToken = OptionalValue("CHROMA_AUTH_TOKEN", "Chroma:AuthToken"),
         Tenant = OptionalValue("CHROMA_TENANT", "Chroma:Tenant"),
@@ -136,7 +135,7 @@ catch (ClientResultException ex)
     Console.Error.WriteLine($"The AI service returned an error (HTTP {ex.Status}). Please try again shortly.");
     Environment.ExitCode = 1;
 }
-catch (Exception ex) when (ex is ChromaException or HttpRequestException)
+catch (Exception ex) when (ex is ChromaApiException or HttpRequestException)
 {
     Console.Error.WriteLine(
         "Vector database error: could not reach the Chroma server. Check CHROMA_BASE_URL and that the " +

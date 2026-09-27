@@ -33,7 +33,7 @@ User question
 |---|---|
 | Reading marks | `Services/ExcelStudentService.cs` reads `StudentScores.xlsx` with ClosedXML; subject columns are discovered from the header row at runtime - nothing is hard-coded. |
 | Calculations (average, ranking, thresholds) | Plain C# in `Tools/StudentScoreTools.cs`. The LLM only chooses which tool to call and phrases the final sentence; it never computes a number. |
-| Teacher-observation retrieval | `Services/SemanticSearchService.cs` chunks `StudentPerformanceNotes.txt`, embeds each chunk with the OpenAI embeddings API, and stores/searches them in a Chroma vector database collection. |
+| Teacher-observation retrieval | `Services/SemanticSearchService.cs` chunks `StudentPerformanceNotes.txt`, embeds each chunk with the OpenAI embeddings API, and stores/searches them in a Chroma vector database collection via `Services/ChromaApiClient.cs`. |
 | Natural-language understanding & phrasing | OpenAI chat model, via `Microsoft.Agents.AI.OpenAI`, for all three agents. |
 | Routing / orchestration | Microsoft Agent Framework (`ChatClient.AsAIAgent`, `AIAgent.AsAIFunction`). |
 | Tracing | `Services/TracingService.cs` posts spans directly to the LangSmith REST API (see below). |
@@ -55,28 +55,36 @@ its knowledge-base store:
 4. A query is embedded once and matched via `ChromaCollectionClient.Query(...)`; results below a
    relevance threshold are treated as "not found" so the agent can say so honestly.
 
-There is no official LangSmith-style .NET SDK for Chroma either, so this uses the community
-**[ChromaDB.Client](https://github.com/ssone95/ChromaDB.Client)** NuGet package (MIT licensed), which
-talks to Chroma's legacy `/api/v1/...` HTTP routes. **Chroma dropped the v1 API in newer server
-releases**, so you must run a v1-API-compatible server - see "Running a local Chroma server" below.
+There is no official .NET SDK for Chroma, and the only community package (`ChromaDB.Client`) only
+speaks Chroma's legacy v1 HTTP API - which **Chroma Cloud does not serve at all** (confirmed live:
+`GET /api/v1/heartbeat` on Chroma Cloud returns `410 {"message":"The v1 API is deprecated. Please use
+/v2 apis"}`). So `Services/ChromaApiClient.cs` instead talks to Chroma's **v2 REST API** directly over
+a plain `HttpClient`, using the exact request/response shapes confirmed against Chroma Cloud's live
+`openapi.json`. This works against both **Chroma Cloud** and a modern self-hosted server.
 
-#### Running a local Chroma server
+Tenant/database resolution: if `CHROMA_TENANT`/`CHROMA_DATABASE` are both set, they're used as-is.
+Otherwise, the client calls `GET /api/v2/auth/identity` (using `CHROMA_AUTH_TOKEN`) to auto-resolve the
+tenant and database a Chroma Cloud API key belongs to; if that call fails (e.g. a self-hosted server
+with no auth configured, which may not implement that route), it falls back to Chroma's conventional
+`default_tenant` / `default_database`.
+
+#### Option A: Chroma Cloud
 
 ```bash
-# Option A: pip (pin below the v2 API cutover)
-pip install "chromadb<0.6"
-chroma run --path ./chroma-data --port 8000
-
-# Option B: Docker, pinned to a v1-API image
-docker run -p 8000:8000 chromadb/chroma:0.5.20
+export CHROMA_BASE_URL=https://api.trychroma.com
+export CHROMA_AUTH_TOKEN=ck-...                            # your Chroma Cloud API key
+export CHROMA_COLLECTION_NAME=student-performance-notes    # optional, this is the default
 ```
 
-Then point the app at it (defaults already assume `http://localhost:8000/api/v1/`):
+#### Option B: self-hosted Chroma
 
 ```bash
-export CHROMA_BASE_URL=http://localhost:8000/api/v1/
-export CHROMA_COLLECTION_NAME=student-performance-notes   # optional, this is the default
-export CHROMA_AUTH_TOKEN=...                                # optional, only if the server has auth enabled
+pip install chromadb
+chroma run --path ./chroma-data --port 8000
+```
+
+```bash
+export CHROMA_BASE_URL=http://localhost:8000   # this is also the default if unset
 ```
 
 ### Tracing with LangSmith
@@ -98,7 +106,7 @@ StudentPerformanceAI/
 ├── Data/               StudentScores.xlsx, StudentPerformanceNotes.txt
 ├── Models/             Student, SemanticSearchResult, OpenAIOptions, LangSmithOptions, ChromaOptions,
 │                       DataPathOptions
-├── Services/           ExcelStudentService, StudentDataStore, SemanticSearchService (Chroma-backed),
+├── Services/           ExcelStudentService, StudentDataStore, SemanticSearchService, ChromaApiClient,
 │                       TracingService
 ├── Tools/              StudentScoreTools (6 deterministic tools), StudentKnowledgeTools (search tool)
 ├── Program.cs
@@ -121,20 +129,21 @@ local development only - it is gitignored and must never be committed).
 | `LANGSMITH_API_KEY` | no | Enables LangSmith tracing when set |
 | `LANGSMITH_PROJECT` | no (default `student-performance-ai`) | LangSmith project name |
 | `LANGSMITH_BASE_URL` | no (default `https://api.smith.langchain.com`) | LangSmith API base URL |
-| `CHROMA_BASE_URL` | no (default `http://localhost:8000/api/v1/`) | Chroma server base URL |
+| `CHROMA_BASE_URL` | no (default `http://localhost:8000`) | Chroma server base URL (Chroma Cloud: `https://api.trychroma.com`) |
 | `CHROMA_COLLECTION_NAME` | no (default `student-performance-notes`) | Chroma collection holding note chunks |
-| `CHROMA_AUTH_TOKEN` | no | Bearer token, only if the Chroma server has auth enabled |
-| `CHROMA_TENANT` / `CHROMA_DATABASE` | no | Override Chroma's default tenant/database |
+| `CHROMA_AUTH_TOKEN` | no (required for Chroma Cloud) | `x-chroma-token` value |
+| `CHROMA_TENANT` / `CHROMA_DATABASE` | no | Skip auto-resolution and use these tenant/database names directly |
 
 ## Running
 
-A Chroma server must be running first - see "Running a local Chroma server" above.
+Either Chroma Cloud or a self-hosted server must be reachable first - see the Chroma options above.
 
 ```bash
 cd StudentPerformanceAI
 export OPENAI_API_KEY=sk-...           # PowerShell: $env:OPENAI_API_KEY = "sk-..."
 export LANGSMITH_API_KEY=lsv2_...      # optional, enables tracing
-export CHROMA_BASE_URL=http://localhost:8000/api/v1/   # optional, this is the default
+export CHROMA_BASE_URL=https://api.trychroma.com   # or omit to use the localhost default
+export CHROMA_AUTH_TOKEN=ck-...                    # required for Chroma Cloud
 dotnet build
 dotnet run
 ```
@@ -176,15 +185,15 @@ doc §13). Suggested set, matching the assessment's minimums:
 
 ## Known limitations & future improvements
 
-- Requires a running, externally-managed Chroma server; the app does not embed or manage the
+- Requires a reachable Chroma instance (Cloud or self-hosted); the app does not embed or manage the
   database process itself.
-- Pinned to Chroma's legacy v1 HTTP API (via the community `ChromaDB.Client` package, which has no
-  v2 support yet) - newer Chroma server releases that dropped v1 are not compatible.
+- `ChromaApiClient` is a small hand-rolled v2 REST client (there's no official .NET SDK for Chroma),
+  covering only the operations this app needs (get-or-create collection, get, upsert, query) - not a
+  general-purpose Chroma client.
 - The knowledge base is still rebuilt from a single flat text file (`StudentPerformanceNotes.txt`);
   Chroma solves the *retrieval* scaling problem, but there's no ingestion pipeline yet for adding
   notes from other sources.
 - LangSmith tracing is a hand-rolled REST client rather than an official SDK; it captures the
   coordinator call and embedding calls but not every intermediate model turn.
-- Future improvements: track the Chroma v2 API once `ChromaDB.Client` (or an alternative) supports
-  it, add an ingestion pipeline for new/updated notes, and add streaming responses for a more
-  responsive console experience.
+- Future improvements: add an ingestion pipeline for new/updated notes, and add streaming responses
+  for a more responsive console experience.

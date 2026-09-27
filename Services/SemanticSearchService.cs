@@ -1,17 +1,17 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
-using ChromaDB.Client;
 using OpenAI.Embeddings;
 using StudentPerformanceAI.Models;
 
 namespace StudentPerformanceAI.Services;
 
 /// <summary>
-/// Semantic search over the teacher-observation notes, backed by a Chroma vector database: chunks the
-/// notes file, embeds each chunk with the OpenAI embeddings API, upserts it into a Chroma collection,
-/// and answers queries via Chroma's nearest-neighbor search. Chroma is the only persistence layer -
-/// there is no local cache file.
+/// Semantic search over the teacher-observation notes, backed by a Chroma vector database (Chroma
+/// Cloud or self-hosted, via its v2 REST API - see <see cref="ChromaApiClient"/>): chunks the notes
+/// file, embeds each chunk with the OpenAI embeddings API, upserts it into a Chroma collection, and
+/// answers queries via Chroma's nearest-neighbor search. Chroma is the only persistence layer - there
+/// is no local cache file.
 /// </summary>
 public sealed partial class SemanticSearchService : IDisposable
 {
@@ -19,10 +19,8 @@ public sealed partial class SemanticSearchService : IDisposable
 
     private readonly EmbeddingClient _embeddingClient;
     private readonly TracingService _tracing;
-    private readonly HttpClient _chromaHttpClient;
-    private readonly ChromaConfigurationOptions _chromaConfig;
+    private readonly ChromaApiClient _chroma;
     private readonly string _collectionName;
-    private ChromaCollectionClient? _collectionClient;
 
     public SemanticSearchService(
         EmbeddingClient embeddingClient, ChromaOptions chromaOptions, TracingService tracing)
@@ -30,12 +28,7 @@ public sealed partial class SemanticSearchService : IDisposable
         _embeddingClient = embeddingClient;
         _tracing = tracing;
         _collectionName = chromaOptions.CollectionName;
-        _chromaConfig = new ChromaConfigurationOptions(
-            uri: chromaOptions.BaseUrl,
-            defaultTenant: chromaOptions.Tenant,
-            defaultDatabase: chromaOptions.Database,
-            chromaToken: chromaOptions.AuthToken);
-        _chromaHttpClient = new HttpClient();
+        _chroma = new ChromaApiClient(chromaOptions);
     }
 
     public async Task InitializeAsync(string notesFilePath, CancellationToken cancellationToken = default)
@@ -45,20 +38,15 @@ public sealed partial class SemanticSearchService : IDisposable
             throw new FileNotFoundException($"Teacher observations file not found at '{notesFilePath}'.", notesFilePath);
         }
 
-        var chromaClient = new ChromaClient(_chromaConfig, _chromaHttpClient);
-        var collection = await chromaClient.GetOrCreateCollection(
-            _collectionName,
-            metadata: new Dictionary<string, object> { ["hnsw:space"] = "cosine" });
-        _collectionClient = new ChromaCollectionClient(collection, _chromaConfig, _chromaHttpClient);
+        await _chroma.InitializeAsync(_collectionName, cancellationToken);
 
         var chunks = ChunkNotes(await File.ReadAllTextAsync(notesFilePath, cancellationToken));
         var chunkIds = chunks.Select(c => ComputeId(c.StudentName, c.Section)).ToList();
 
-        var existing = await _collectionClient.Get(chunkIds, include: ChromaGetInclude.Documents);
-        var existingTextById = existing.ToDictionary(e => e.Id, e => e.Document);
+        var existingTextById = await _chroma.GetDocumentsAsync(chunkIds, cancellationToken);
 
         var idsToUpsert = new List<string>();
-        var embeddingsToUpsert = new List<ReadOnlyMemory<float>>();
+        var embeddingsToUpsert = new List<float[]>();
         var metadatasToUpsert = new List<Dictionary<string, object>>();
         var documentsToUpsert = new List<string>();
 
@@ -73,7 +61,7 @@ public sealed partial class SemanticSearchService : IDisposable
             await using var span = _tracing.StartSpan(
                 "embed_chunk", "embedding", new { chunk.StudentName, chunk.Section });
             var result = await _embeddingClient.GenerateEmbeddingAsync(chunk.Text, cancellationToken: cancellationToken);
-            var embedding = result.Value.ToFloats();
+            var embedding = result.Value.ToFloats().ToArray();
             await span.EndAsync(new { Dimensions = embedding.Length });
 
             idsToUpsert.Add(id);
@@ -88,28 +76,20 @@ public sealed partial class SemanticSearchService : IDisposable
 
         if (idsToUpsert.Count > 0)
         {
-            await _collectionClient.Upsert(idsToUpsert, embeddingsToUpsert, metadatasToUpsert, documentsToUpsert);
+            await _chroma.UpsertAsync(idsToUpsert, embeddingsToUpsert, metadatasToUpsert, documentsToUpsert, cancellationToken);
         }
     }
 
     public async Task<IReadOnlyList<SemanticSearchResult>> SearchAsync(
         string query, int topK = 3, CancellationToken cancellationToken = default)
     {
-        if (_collectionClient is null)
-        {
-            throw new InvalidOperationException("SemanticSearchService.InitializeAsync must be called before SearchAsync.");
-        }
-
         var queryResult = await _embeddingClient.GenerateEmbeddingAsync(query, cancellationToken: cancellationToken);
-        var matches = await _collectionClient.Query(
-            queryResult.Value.ToFloats(),
-            nResults: topK,
-            include: ChromaQueryInclude.Metadatas | ChromaQueryInclude.Documents | ChromaQueryInclude.Distances);
+        var matches = await _chroma.QueryAsync(queryResult.Value.ToFloats().ToArray(), topK, cancellationToken);
 
         return matches
             .Select(m => new SemanticSearchResult(
-                StudentName: m.Metadata?.GetValueOrDefault("studentName")?.ToString() ?? "Unknown",
-                Section: m.Metadata?.GetValueOrDefault("section")?.ToString() ?? "Unknown",
+                StudentName: m.StudentName ?? "Unknown",
+                Section: m.Section ?? "Unknown",
                 Text: m.Document ?? string.Empty,
                 Score: 1 - m.Distance))
             .Where(r => r.Score >= RelevanceThreshold)
@@ -156,7 +136,7 @@ public sealed partial class SemanticSearchService : IDisposable
         return chunks;
     }
 
-    public void Dispose() => _chromaHttpClient.Dispose();
+    public void Dispose() => _chroma.Dispose();
 
     [GeneratedRegex(@"(?m)^###\s+")]
     private static partial Regex StudentHeaderRegex();

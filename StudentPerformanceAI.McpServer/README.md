@@ -30,7 +30,8 @@ by default, so either process can index/query the same collection.
 ```bash
 cd StudentPerformanceAI.McpServer
 export OPENAI_API_KEY=sk-...
-export CHROMA_BASE_URL=http://localhost:8000/api/v1/    # optional, this is the default
+export CHROMA_BASE_URL=https://api.trychroma.com        # or omit to use the localhost default
+export CHROMA_AUTH_TOKEN=ck-...                         # required for Chroma Cloud
 dotnet build
 dotnet run
 ```
@@ -64,5 +65,5 @@ identical.
 ## Known limitations
 
 - No authentication is configured; this is meant for local development against `localhost` only.
-- Like the console app, it requires an externally-running Chroma server pinned to the legacy v1 API
-  (see the main `README.md`).
+- Like the console app, it requires a reachable Chroma instance - Cloud or self-hosted - over Chroma's
+  v2 API (see the main `README.md`).
