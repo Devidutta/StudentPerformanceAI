@@ -38,7 +38,7 @@ public sealed class TracingService : IDisposable
 
         try
         {
-            await _http.PostAsJsonAsync("api/v1/runs", new
+            var response = await _http.PostAsJsonAsync("api/v1/runs", new
             {
                 id = span.RunId,
                 trace_id = span.TraceId,
@@ -49,10 +49,13 @@ public sealed class TracingService : IDisposable
                 inputs = span.Inputs ?? new { },
                 start_time = span.StartedAt.ToString("o")
             });
+            await WarnIfUnsuccessfulAsync("create run", response);
         }
-        catch
+        catch (Exception ex)
         {
-            // Tracing must never break the application.
+            // Tracing must never break the application, but a silent failure here is impossible to
+            // diagnose, so at least surface it.
+            Console.Error.WriteLine($"[LangSmith] Failed to create run '{span.Name}': {ex.Message}");
         }
     }
 
@@ -65,17 +68,29 @@ public sealed class TracingService : IDisposable
 
         try
         {
-            await _http.PatchAsync($"api/v1/runs/{span.RunId}", JsonContent.Create(new
+            var response = await _http.PatchAsync($"api/v1/runs/{span.RunId}", JsonContent.Create(new
             {
                 outputs = outputs ?? new { },
                 error,
                 end_time = DateTimeOffset.UtcNow.ToString("o")
             }));
+            await WarnIfUnsuccessfulAsync("update run", response);
         }
-        catch
+        catch (Exception ex)
         {
-            // Tracing must never break the application.
+            Console.Error.WriteLine($"[LangSmith] Failed to update run '{span.Name}': {ex.Message}");
         }
+    }
+
+    private static async Task WarnIfUnsuccessfulAsync(string action, HttpResponseMessage response)
+    {
+        if (response.IsSuccessStatusCode)
+        {
+            return;
+        }
+
+        var body = await response.Content.ReadAsStringAsync();
+        Console.Error.WriteLine($"[LangSmith] Failed to {action}: HTTP {(int)response.StatusCode} - {body}");
     }
 
     public void Dispose() => _http.Dispose();
@@ -85,6 +100,7 @@ public sealed class TracingService : IDisposable
 public sealed class TraceSpan : IAsyncDisposable
 {
     private readonly TracingService _tracer;
+    private readonly Task _startTask;
     private bool _ended;
 
     public string RunId { get; } = Guid.NewGuid().ToString();
@@ -103,7 +119,7 @@ public sealed class TraceSpan : IAsyncDisposable
         Inputs = inputs;
         ParentRunId = parentRunId;
         TraceId = parentRunId ?? RunId;
-        _ = _tracer.PostRunStartAsync(this);
+        _startTask = _tracer.PostRunStartAsync(this);
     }
 
     public async Task EndAsync(object? outputs = null, string? error = null)
@@ -114,6 +130,7 @@ public sealed class TraceSpan : IAsyncDisposable
         }
 
         _ended = true;
+        await _startTask; // ensure the run was created before patching it - avoids a start/end race.
         await _tracer.PostRunEndAsync(this, outputs, error);
     }
 
