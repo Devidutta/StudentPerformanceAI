@@ -4,4 +4,3 @@ obj/
 appsettings.Local.json
 *.local.json
 .env
-Data/embedding-cache.json

@@ -1,4 +1,5 @@
 using System.ClientModel;
+using ChromaDB.Client;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.Configuration;
 using OpenAI;
@@ -55,8 +56,16 @@ try
     var dataPaths = new DataPathOptions
     {
         ScoresWorkbook = Path.Combine(AppContext.BaseDirectory, OptionalValue("SCORES_WORKBOOK_PATH", "DataPaths:ScoresWorkbook", "Data/StudentScores.xlsx")!),
-        PerformanceNotes = Path.Combine(AppContext.BaseDirectory, OptionalValue("PERFORMANCE_NOTES_PATH", "DataPaths:PerformanceNotes", "Data/StudentPerformanceNotes.txt")!),
-        EmbeddingCache = Path.Combine(AppContext.BaseDirectory, OptionalValue("EMBEDDING_CACHE_PATH", "DataPaths:EmbeddingCache", "Data/embedding-cache.json")!)
+        PerformanceNotes = Path.Combine(AppContext.BaseDirectory, OptionalValue("PERFORMANCE_NOTES_PATH", "DataPaths:PerformanceNotes", "Data/StudentPerformanceNotes.txt")!)
+    };
+
+    var chromaOptions = new ChromaOptions
+    {
+        BaseUrl = OptionalValue("CHROMA_BASE_URL", "Chroma:BaseUrl", "http://localhost:8000/api/v1/")!,
+        CollectionName = OptionalValue("CHROMA_COLLECTION_NAME", "Chroma:CollectionName", "student-performance-notes")!,
+        AuthToken = OptionalValue("CHROMA_AUTH_TOKEN", "Chroma:AuthToken"),
+        Tenant = OptionalValue("CHROMA_TENANT", "Chroma:Tenant"),
+        Database = OptionalValue("CHROMA_DATABASE", "Chroma:Database")
     };
 
     using var tracing = new TracingService(langSmithOptions);
@@ -78,9 +87,8 @@ try
     var dataStore = new StudentDataStore(dataPaths.ScoresWorkbook);
     Console.WriteLine($"Loaded {dataStore.Students.Count} students across subjects: {string.Join(", ", dataStore.Subjects)}.");
 
-    Console.WriteLine("Indexing teacher observations for semantic search...");
-    var embeddingCache = new EmbeddingCacheService(dataPaths.EmbeddingCache);
-    var semanticSearch = new SemanticSearchService(embeddingClient, embeddingCache, tracing);
+    Console.WriteLine($"Indexing teacher observations into Chroma collection '{chromaOptions.CollectionName}' at {chromaOptions.BaseUrl}...");
+    using var semanticSearch = new SemanticSearchService(embeddingClient, chromaOptions, tracing);
     await semanticSearch.InitializeAsync(dataPaths.PerformanceNotes);
 
     var scoreTools = new StudentScoreTools(dataStore);
@@ -116,6 +124,13 @@ catch (ClientResultException ex) when (ex.Status is 401 or 403)
 catch (ClientResultException ex)
 {
     Console.Error.WriteLine($"The AI service returned an error (HTTP {ex.Status}). Please try again shortly.");
+    Environment.ExitCode = 1;
+}
+catch (Exception ex) when (ex is ChromaException or HttpRequestException)
+{
+    Console.Error.WriteLine(
+        "Vector database error: could not reach the Chroma server. Check CHROMA_BASE_URL and that the " +
+        $"server is running. ({ex.Message})");
     Environment.ExitCode = 1;
 }
 catch (Exception ex)
@@ -193,6 +208,11 @@ static async Task RunReplAsync(AIAgent coordinator, TracingService tracing)
         {
             Console.WriteLine($"Sorry, the AI service is temporarily unavailable (HTTP {ex.Status}). Please try again.");
             await span.EndAsync(error: $"http {ex.Status}");
+        }
+        catch (Exception ex) when (ex is ChromaException or HttpRequestException)
+        {
+            Console.WriteLine("Sorry, the Chroma vector database is unreachable right now. Please check it's running and try again.");
+            await span.EndAsync(error: ex.Message);
         }
         catch (Exception ex)
         {

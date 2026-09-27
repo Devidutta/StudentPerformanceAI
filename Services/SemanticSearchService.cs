@@ -1,30 +1,41 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using ChromaDB.Client;
 using OpenAI.Embeddings;
 using StudentPerformanceAI.Models;
 
 namespace StudentPerformanceAI.Services;
 
 /// <summary>
-/// In-process semantic search over the teacher-observation notes: chunks the notes file, embeds each
-/// chunk with the OpenAI embeddings API, and answers queries via cosine-similarity search. No external
-/// vector database or search service is used.
+/// Semantic search over the teacher-observation notes, backed by a Chroma vector database: chunks the
+/// notes file, embeds each chunk with the OpenAI embeddings API, upserts it into a Chroma collection,
+/// and answers queries via Chroma's nearest-neighbor search. Chroma is the only persistence layer -
+/// there is no local cache file.
 /// </summary>
-public sealed partial class SemanticSearchService
+public sealed partial class SemanticSearchService : IDisposable
 {
     private const double RelevanceThreshold = 0.24;
 
     private readonly EmbeddingClient _embeddingClient;
-    private readonly EmbeddingCacheService _cache;
     private readonly TracingService _tracing;
-    private readonly List<IndexedChunk> _index = [];
+    private readonly HttpClient _chromaHttpClient;
+    private readonly ChromaConfigurationOptions _chromaConfig;
+    private readonly string _collectionName;
+    private ChromaCollectionClient? _collectionClient;
 
-    public SemanticSearchService(EmbeddingClient embeddingClient, EmbeddingCacheService cache, TracingService tracing)
+    public SemanticSearchService(
+        EmbeddingClient embeddingClient, ChromaOptions chromaOptions, TracingService tracing)
     {
         _embeddingClient = embeddingClient;
-        _cache = cache;
         _tracing = tracing;
+        _collectionName = chromaOptions.CollectionName;
+        _chromaConfig = new ChromaConfigurationOptions(
+            uri: chromaOptions.BaseUrl,
+            defaultTenant: chromaOptions.Tenant,
+            defaultDatabase: chromaOptions.Database,
+            chromaToken: chromaOptions.AuthToken);
+        _chromaHttpClient = new HttpClient();
     }
 
     public async Task InitializeAsync(string notesFilePath, CancellationToken cancellationToken = default)
@@ -34,60 +45,80 @@ public sealed partial class SemanticSearchService
             throw new FileNotFoundException($"Teacher observations file not found at '{notesFilePath}'.", notesFilePath);
         }
 
-        _cache.Load();
-        _index.Clear();
+        var chromaClient = new ChromaClient(_chromaConfig, _chromaHttpClient);
+        var collection = await chromaClient.GetOrCreateCollection(
+            _collectionName,
+            metadata: new Dictionary<string, object> { ["hnsw:space"] = "cosine" });
+        _collectionClient = new ChromaCollectionClient(collection, _chromaConfig, _chromaHttpClient);
 
         var chunks = ChunkNotes(await File.ReadAllTextAsync(notesFilePath, cancellationToken));
+        var chunkIds = chunks.Select(c => ComputeId(c.StudentName, c.Section)).ToList();
+
+        var existing = await _collectionClient.Get(chunkIds, include: ChromaGetInclude.Documents);
+        var existingTextById = existing.ToDictionary(e => e.Id, e => e.Document);
+
+        var idsToUpsert = new List<string>();
+        var embeddingsToUpsert = new List<ReadOnlyMemory<float>>();
+        var metadatasToUpsert = new List<Dictionary<string, object>>();
+        var documentsToUpsert = new List<string>();
+
         foreach (var chunk in chunks)
         {
-            var hash = ComputeHash(chunk.Text);
-            var embedding = _cache.TryGet(hash);
-            if (embedding is null)
+            var id = ComputeId(chunk.StudentName, chunk.Section);
+            if (existingTextById.TryGetValue(id, out var existingText) && existingText == chunk.Text)
             {
-                await using var span = _tracing.StartSpan(
-                    "embed_chunk", "embedding", new { chunk.StudentName, chunk.Section });
-                var result = await _embeddingClient.GenerateEmbeddingAsync(chunk.Text, cancellationToken: cancellationToken);
-                embedding = result.Value.ToFloats().ToArray();
-                _cache.Set(hash, embedding);
-                await span.EndAsync(new { Dimensions = embedding.Length });
+                continue; // unchanged - skip re-embedding
             }
 
-            _index.Add(new IndexedChunk(chunk.StudentName, chunk.Section, chunk.Text, embedding));
+            await using var span = _tracing.StartSpan(
+                "embed_chunk", "embedding", new { chunk.StudentName, chunk.Section });
+            var result = await _embeddingClient.GenerateEmbeddingAsync(chunk.Text, cancellationToken: cancellationToken);
+            var embedding = result.Value.ToFloats();
+            await span.EndAsync(new { Dimensions = embedding.Length });
+
+            idsToUpsert.Add(id);
+            embeddingsToUpsert.Add(embedding);
+            metadatasToUpsert.Add(new Dictionary<string, object>
+            {
+                ["studentName"] = chunk.StudentName,
+                ["section"] = chunk.Section
+            });
+            documentsToUpsert.Add(chunk.Text);
         }
 
-        _cache.Save();
+        if (idsToUpsert.Count > 0)
+        {
+            await _collectionClient.Upsert(idsToUpsert, embeddingsToUpsert, metadatasToUpsert, documentsToUpsert);
+        }
     }
 
     public async Task<IReadOnlyList<SemanticSearchResult>> SearchAsync(
         string query, int topK = 3, CancellationToken cancellationToken = default)
     {
-        var queryResult = await _embeddingClient.GenerateEmbeddingAsync(query, cancellationToken: cancellationToken);
-        var queryEmbedding = queryResult.Value.ToFloats();
+        if (_collectionClient is null)
+        {
+            throw new InvalidOperationException("SemanticSearchService.InitializeAsync must be called before SearchAsync.");
+        }
 
-        return _index
-            .Select(chunk => new SemanticSearchResult(
-                chunk.StudentName, chunk.Section, chunk.Text, CosineSimilarity(queryEmbedding.Span, chunk.Embedding)))
+        var queryResult = await _embeddingClient.GenerateEmbeddingAsync(query, cancellationToken: cancellationToken);
+        var matches = await _collectionClient.Query(
+            queryResult.Value.ToFloats(),
+            nResults: topK,
+            include: ChromaQueryInclude.Metadatas | ChromaQueryInclude.Documents | ChromaQueryInclude.Distances);
+
+        return matches
+            .Select(m => new SemanticSearchResult(
+                StudentName: m.Metadata?.GetValueOrDefault("studentName")?.ToString() ?? "Unknown",
+                Section: m.Metadata?.GetValueOrDefault("section")?.ToString() ?? "Unknown",
+                Text: m.Document ?? string.Empty,
+                Score: 1 - m.Distance))
             .Where(r => r.Score >= RelevanceThreshold)
             .OrderByDescending(r => r.Score)
-            .Take(topK)
             .ToList();
     }
 
-    private static string ComputeHash(string text) =>
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
-
-    private static double CosineSimilarity(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
-    {
-        double dot = 0, normA = 0, normB = 0;
-        for (var i = 0; i < a.Length; i++)
-        {
-            dot += a[i] * b[i];
-            normA += a[i] * a[i];
-            normB += b[i] * b[i];
-        }
-
-        return normA == 0 || normB == 0 ? 0 : dot / (Math.Sqrt(normA) * Math.Sqrt(normB));
-    }
+    private static string ComputeId(string studentName, string section) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{studentName}|{section}")));
 
     /// <summary>
     /// Splits the notes file into per-student, per-section chunks. Expected format:
@@ -125,6 +156,8 @@ public sealed partial class SemanticSearchService
         return chunks;
     }
 
+    public void Dispose() => _chromaHttpClient.Dispose();
+
     [GeneratedRegex(@"(?m)^###\s+")]
     private static partial Regex StudentHeaderRegex();
 
@@ -132,6 +165,4 @@ public sealed partial class SemanticSearchService
     private static partial Regex SectionRegex();
 
     private readonly record struct NoteChunk(string StudentName, string Section, string Text);
-
-    private readonly record struct IndexedChunk(string StudentName, string Section, string Text, float[] Embedding);
 }
