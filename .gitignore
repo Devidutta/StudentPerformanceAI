@@ -1,0 +1,7 @@
+bin/
+obj/
+.vs/
+appsettings.Local.json
+*.local.json
+.env
+Data/embedding-cache.json
