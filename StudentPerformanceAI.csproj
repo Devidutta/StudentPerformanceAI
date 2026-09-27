@@ -10,6 +10,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The MCP server lives in a nested sibling project folder; exclude it from this project's default globs. -->
+    <Compile Remove="StudentPerformanceAI.McpServer\**\*.cs" />
+    <None Remove="StudentPerformanceAI.McpServer\**\*" />
+    <Content Remove="StudentPerformanceAI.McpServer\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="ChromaDB.Client" Version="1.0.0" />
     <PackageReference Include="ClosedXML" Version="0.105.1" />
     <PackageReference Include="Microsoft.Agents.AI" Version="1.22.0" />

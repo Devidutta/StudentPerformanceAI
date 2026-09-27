@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="StudentPerformanceAI.csproj" />
+  <Project Path="StudentPerformanceAI.McpServer/StudentPerformanceAI.McpServer.csproj" />
+</Solution>
